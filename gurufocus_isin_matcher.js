@@ -4,11 +4,15 @@ import path from 'path';
 
 class GuruFocusISINMatcher {
     constructor(options = {}) {
-        this.headless = options.headless !== true; // Default to headless
+        // Headless: true = no browser window, false = visible browser window
+        this.headless = options.headless !== true; // Default to headless (true)
         this.delay = options.delay || 2000; // Default delay between requests
         this.results = [];
         this.browser = null;
+        this.context = null; // Store the browser context
         this.page = null;
+        
+        console.log(`🔧 Configuration: ${this.headless ? 'Headless' : 'Visible'} Browser`);
     }
 
     /**
@@ -37,28 +41,30 @@ class GuruFocusISINMatcher {
      * Initialize the browser
      */
     async initBrowser() {
-        console.log('Initializing browser in private mode...');
+        console.log(`🚀 Launching browser: ${this.headless ? 'Headless' : 'Visible'} mode`);
+        
         this.browser = await puppeteer.launch({
             headless: this.headless,
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox',
-                '--incognito',  // Always run in private/incognito mode
                 '--disable-web-security',
                 '--disable-features=VizDisplayCompositor'
             ]
         });
         
-        // Create a new incognito context for extra privacy
-        const context = await this.browser.createBrowserContext();
-        this.page = await context.newPage();
+        // Create isolated browser context
+        this.context = await this.browser.createBrowserContext();
+        this.page = await this.context.newPage();
         
         // Set a reasonable viewport and user agent
         await this.page.setViewport({ width: 1280, height: 720 });
         await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
         
-        console.log('Browser initialized in private mode ✓');
+        console.log('✅ Browser launched successfully');
     }
+
+
 
     /**
      * Search for a company on GuruFocus
@@ -72,13 +78,53 @@ class GuruFocusISINMatcher {
             await this.page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
             await new Promise(resolve => setTimeout(resolve, this.delay));
 
-            // Look for stock results in the "Stocks" section
-            const stockLinks = await this.page.$$eval('a[href*="/stock/"]', links => 
-                links.map(link => ({
+            // Look for stock results ONLY in the "Stocks" table section
+            const stockLinks = await this.page.evaluate(() => {
+                const stocksSection = document.querySelector('#stocks') || 
+                                    document.querySelector('[data-testid="stocks"]') ||
+                                    Array.from(document.querySelectorAll('h2, h3, div')).find(el => 
+                                        el.textContent && el.textContent.trim().toLowerCase() === 'stocks'
+                                    );
+                
+                let tableContainer = null;
+                
+                if (stocksSection) {
+                    // Find the table after the "Stocks" heading
+                    tableContainer = stocksSection.closest('div').querySelector('table') ||
+                                   stocksSection.parentElement?.querySelector('table') ||
+                                   stocksSection.nextElementSibling?.querySelector('table');
+                }
+                
+                // Fallback: look for any table containing stock links
+                if (!tableContainer) {
+                    const tables = document.querySelectorAll('table, [role="table"]');
+                    for (const table of tables) {
+                        const stockLinksInTable = table.querySelectorAll('a[href*="/stock/"]');
+                        if (stockLinksInTable.length > 0) {
+                            tableContainer = table;
+                            break;
+                        }
+                    }
+                }
+                
+                // Extract links only from the identified table
+                if (tableContainer) {
+                    const links = tableContainer.querySelectorAll('a[href*="/stock/"]');
+                    return Array.from(links).map(link => ({
+                        url: link.href,
+                        text: link.textContent?.trim() || '',
+                        ticker: link.textContent?.trim() || ''
+                    }));
+                }
+                
+                // Final fallback: try to find ticker links in a more structured way
+                const tickerLinks = document.querySelectorAll('tr a[href*="/stock/"], td a[href*="/stock/"]');
+                return Array.from(tickerLinks).map(link => ({
                     url: link.href,
-                    text: link.textContent?.trim() || ''
-                }))
-            );
+                    text: link.textContent?.trim() || '',
+                    ticker: link.textContent?.trim() || ''
+                }));
+            });
 
             console.log(`Found ${stockLinks.length} stock links`);
             return stockLinks;
@@ -211,6 +257,31 @@ class GuruFocusISINMatcher {
     }
 
     /**
+     * Close current browser context and create a fresh one
+     */
+    async refreshBrowserContext() {
+        console.log('🔄 Refreshing browser context for clean storage...');
+        
+        // Close current page and context
+        if (this.page) {
+            await this.page.close();
+        }
+        if (this.context) {
+            await this.context.close();
+        }
+        
+        // Create fresh browser context
+        this.context = await this.browser.createBrowserContext();
+        this.page = await this.context.newPage();
+        
+        // Set viewport and user agent again
+        await this.page.setViewport({ width: 1280, height: 720 });
+        await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+        
+        console.log('✅ Fresh browser context created with clean storage');
+    }
+
+    /**
      * Process multiple companies
      */
     async processCompanies(companies, maxCompanies = null) {
@@ -221,14 +292,49 @@ class GuruFocusISINMatcher {
             const company = companiesToProcess[i];
             console.log(`\n[${i + 1}/${companiesToProcess.length}] Processing: ${company.companyName}`);
             
+            // For companies after the first one, refresh browser context for clean storage
+            if (i > 0) {
+                await this.refreshBrowserContext();
+            }
+            
             const result = await this.processCompany(company);
             this.results.push(result);
+
+            // Save CSV every 10 companies
+            if ((i + 1) % 10 === 0) {
+                const matchesCount = this.results.filter(r => r.status === 'matched').length;
+                if (this.saveMatchesCSV()) {
+                    console.log(`📊 Progress saved: ${matchesCount} matches found after ${i + 1} companies`);
+                }
+            }
 
             // Add delay between companies to be respectful to the server
             if (i < companiesToProcess.length - 1) {
                 console.log(`Waiting ${this.delay}ms before next company...`);
                 await new Promise(resolve => setTimeout(resolve, this.delay));
             }
+        }
+    }
+
+    /**
+     * Save CSV file with current matches
+     */
+    saveMatchesCSV() {
+        try {
+            const csvResults = this.results
+                .filter(r => r.status === 'matched')
+                .map(r => `${r.companyName},${r.expectedISIN},${r.matchingURL}`)
+                .join('\n');
+            
+            if (csvResults) {
+                const csvHeader = 'Company Name,ISIN Code,GuruFocus URL\n';
+                fs.writeFileSync('gurufocus_matches.csv', csvHeader + csvResults);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            console.error('Error saving CSV:', error);
+            return false;
         }
     }
 
@@ -250,15 +356,8 @@ class GuruFocusISINMatcher {
             fs.writeFileSync(filename, JSON.stringify(output, null, 2));
             console.log(`\nResults saved to ${filename}`);
             
-            // Also save a CSV file with the matches
-            const csvResults = this.results
-                .filter(r => r.status === 'matched')
-                .map(r => `${r.companyName},${r.expectedISIN},${r.matchingURL}`)
-                .join('\n');
-            
-            if (csvResults) {
-                const csvHeader = 'Company Name,ISIN Code,GuruFocus URL\n';
-                fs.writeFileSync('gurufocus_matches.csv', csvHeader + csvResults);
+            // Save CSV file with matches
+            if (this.saveMatchesCSV()) {
                 console.log('Matches saved to gurufocus_matches.csv');
             }
 
@@ -291,9 +390,16 @@ class GuruFocusISINMatcher {
      * Close the browser
      */
     async close() {
+        if (this.page) {
+            await this.page.close();
+        }
+        if (this.context) {
+            await this.context.close();
+        }
         if (this.browser) {
             await this.browser.close();
         }
+        console.log('Browser session closed ✓');
     }
 
     /**
