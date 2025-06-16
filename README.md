@@ -1,4 +1,4 @@
-# 📊 Gurufocus Scraper
+# 📊 Scraper
 
 A Node.js web scraper built with Puppeteer to extract financial data from Gurufocus.com with incognito mode support.
 
