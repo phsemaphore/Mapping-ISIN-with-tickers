@@ -5,7 +5,7 @@ import path from 'path';
 class GuruFocusISINMatcher {
     constructor(options = {}) {
         // Headless: true = no browser window, false = visible browser window
-        this.headless = options.headless !== true; // Default to headless (true)
+        this.headless = options.headless !== false; // Default to headless (true)
         this.delay = options.delay || 2000; // Default delay between requests
         this.results = [];
         this.browser = null;
